@@ -25,6 +25,20 @@ Token của worker tính vào quota OpenAI, không tính vào Claude. Nhưng m�
 - **Đáng giao:** đọc nhiều file hoặc log dài, khảo sát codebase lạ, sửa nhiều vòng đến khi test pass, nghiên cứu web, xử lý dữ liệu lớn, việc chạy lâu có thể làm song song trong lúc Claude làm việc khác, hoặc khi người dùng muốn tiết kiệm quota Claude hay cần góc nhìn của model khác.
 - **Không đáng giao:** việc Claude tự làm được trong vài lần gọi tool, như sửa vài dòng hay đọc 2–3 file nhỏ. Giao những việc này tốn token Claude hơn tự làm. Nếu người dùng vẫn yêu cầu giao thì làm, nhưng nói một câu về chi phí.
 
+## Hỗ trợ lên plan (task lớn)
+Khi Claude cần lên plan cho một task lớn trên codebase hay tài liệu lạ, chia việc như sau:
+- **Thu thập ngữ cảnh → giao worker `read`.** Đọc file, lần theo lời gọi hàm, đọc log hay tài liệu là phần tốn token nhất. Mọi thứ Claude tự đọc nằm lại trong ngữ cảnh và làm mọi lượt suy nghĩ sau đắt thêm. Worker trả về JSON cô đọng nên ngữ cảnh của Claude gọn.
+- **Suy luận và quyết định → Claude tự làm.** Không giao cho worker phần cân nhắc phương án hay thiết kế.
+
+Cách làm:
+1. Claude viết ra các **câu hỏi cụ thể** cần trả lời để lên plan, ví dụ "request đi qua những hàm nào từ route X đến DB", "những chỗ nào ghi vào bảng Y", "test nào đang bao phủ module Z".
+2. Gom các câu hỏi theo vùng, mỗi vùng một worker `read` (`--name ctx-<vùng>`, 1–3 worker chạy song song). Mỗi câu trả lời phải là một finding có `evidence` dạng `file:dòng`. Câu nào không trả lời được thì ghi rõ trong `deviations`, không được đoán.
+3. Claude suy nghĩ trên các bản kết quả. Với những điểm **quyết định hướng đi của plan**, Claude tự đọc đúng các dòng trong `evidence`, không đọc lan ra cả file.
+4. Tuỳ chọn, với plan rủi ro: giao plan nháp cho một worker `read` (`--name critique`) để tìm lỗ hổng, như trường hợp bị bỏ sót, chỗ mâu thuẫn với code thật, hay bước không kiểm chứng được. Claude tự quyết định nhận góp ý nào.
+5. Plan chốt xong mới giao phần thực thi (worker `edit`) hoặc Claude tự làm.
+
+Không dùng cách này khi codebase nhỏ hoặc Claude đã nắm rõ (tự đọc nhanh và rẻ hơn), hoặc khi cần trả lời ngay (worker mất 1–3 phút).
+
 ## Quy trình
 
 1. **Hiểu việc và chuẩn bị.** Xác định thư mục làm việc `<dir>`. Với chế độ edit: nếu `<dir>` là git repo có thay đổi chưa commit trong phạm vi sẽ sửa, hỏi người dùng có commit trước không. Không phải git thì cx-worker tự chụp snapshot phạm vi để khôi phục được.
