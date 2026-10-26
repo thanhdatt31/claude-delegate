@@ -20,11 +20,16 @@ Scripts nằm trong `scripts/` cạnh file này (dùng đường dẫn tuyệt �
 
 Không nên giao: việc mơ hồ cần trao đổi nhiều với người dùng, việc cần quyết định thiết kế, việc không có cách nào kiểm chứng. Những việc này Claude tự làm.
 
+## Khi nào đáng giao (chi phí token)
+Token của worker tính vào quota OpenAI, không tính vào Claude. Nhưng mỗi lượt Claude điều phối (viết nhiệm vụ, nhận thông báo, duyệt, review) đều tốn token Claude. Chỉ giao khi phần việc của worker nặng hơn hẳn phần điều phối:
+- **Đáng giao:** đọc nhiều file hoặc log dài, khảo sát codebase lạ, sửa nhiều vòng đến khi test pass, nghiên cứu web, xử lý dữ liệu lớn, việc chạy lâu có thể làm song song trong lúc Claude làm việc khác, hoặc khi người dùng muốn tiết kiệm quota Claude hay cần góc nhìn của model khác.
+- **Không đáng giao:** việc Claude tự làm được trong vài lần gọi tool, như sửa vài dòng hay đọc 2–3 file nhỏ. Giao những việc này tốn token Claude hơn tự làm. Nếu người dùng vẫn yêu cầu giao thì làm, nhưng nói một câu về chi phí.
+
 ## Quy trình
 
 1. **Hiểu việc và chuẩn bị.** Xác định thư mục làm việc `<dir>`. Với chế độ edit: nếu `<dir>` là git repo có thay đổi chưa commit trong phạm vi sẽ sửa, hỏi người dùng có commit trước không. Không phải git thì cx-worker tự chụp snapshot phạm vi để khôi phục được.
-2. **Viết file nhiệm vụ** (ở thư mục tạm, không đặt trong `<dir>` nếu là chế độ read). Nhiệm vụ phải có:
-   - Mục tiêu và các bước đánh số.
+2. **Viết file nhiệm vụ** (ở thư mục tạm, không đặt trong `<dir>` nếu là chế độ read). **Đừng tự đọc code hay dữ liệu để viết plan chi tiết**, vì đọc là việc của worker. Chỉ đọc đủ để xác định mục tiêu, phạm vi và cách kiểm chứng. Nhiệm vụ phải có:
+   - Mục tiêu. Chỉ chia bước đánh số khi thứ tự thật sự quan trọng.
    - **Tiêu chí hoàn thành** kiểm chứng được: lệnh test hay kiểm tra, con số phải khớp, hoặc yêu cầu bằng chứng (file:dòng, output, URL).
    - Phạm vi: được và không được đụng vào đâu.
 3. **Người dùng duyệt** khi việc có sửa file, dùng mạng, hoặc tốn nhiều thời gian. Việc chỉ đọc và ngắn thì có thể giao luôn, nói một dòng là đang giao gì.
@@ -36,13 +41,18 @@ Không nên giao: việc mơ hồ cần trao đổi nhiều với người dùng
    - `--bash-allow` chỉ ghi lệnh worker cần chạy để làm và kiểm chứng. Lệnh chỉ đọc phổ biến đã được tự duyệt sẵn.
    - Kết quả mặc định là JSON gồm `status, summary, findings[{title,detail,evidence}], files_changed, checks, sources, deviations, next_steps`. Muốn khuôn khác thì `--schema <file.json>`, muốn văn bản tự do thì `--schema none`.
    - Song song: mỗi worker một `--name` riêng. Hai worker edit không được trùng phạm vi file.
-5. **Giám sát** bằng Monitor trên file output của lệnh nền:
-   `tail -n +1 -f <output> | grep --line-buffered -E "⚠|‼|💬|✘|■|Traceback"`
-   - `⚠ CẦN DUYỆT <key>`: đọc lệnh. Chỉ đọc, hoặc rõ ràng phục vụ nhiệm vụ, thì `cx-worker ctl <dir> approve <key> --name <tên>`. Nghi ngờ thì `deny`.
-   - Worker đi lệch: `cx-worker ctl <dir> steer "<chỉ dẫn cụ thể>" --name <tên>`. Lệch nặng thì `ctl ... interrupt`.
-   - Báo người dùng ngắn gọn khi chuyển bước hoặc có sự cố, không thuật lại từng sự kiện.
-6. **Kiểm chứng độc lập, không tin báo cáo của worker:**
-   - Đọc `cx-worker result <dir> --name <tên>`.
+5. **Giám sát tiết kiệm.** Mỗi thông báo là một lượt Claude, nên chỉ nghe những gì cần hành động:
+   - Lệnh nền tự báo khi worker xong, nên **không cần Monitor để biết lúc xong**.
+   - Chế độ `read` không có bước duyệt: **không bật Monitor**, chỉ chờ thông báo hoàn thành.
+   - Chế độ `edit`: bật Monitor chỉ cho yêu cầu duyệt và sự cố:
+     `tail -n +1 -f <output> | grep --line-buffered -E "⚠|‼|Traceback"`
+     Đặt `timeout_ms` bằng thời gian dự kiến của việc, tối đa 30 phút.
+   - `⚠ CẦN DUYỆT <key>`: đọc lệnh. Chỉ đọc, hoặc rõ ràng phục vụ nhiệm vụ, thì `cx-worker ctl <dir> approve <key> --name <tên>`. Nghi ngờ thì `deny`. Một loại lệnh cứ phải duyệt lặp lại thì lần sau thêm vào `--bash-allow`.
+   - Muốn xem tiến độ (khi người dùng hỏi, hoặc việc chạy lâu bất thường): đọc vài dòng cuối của file output một lần. Các dòng `💬 BƯỚC n` cho biết worker đang ở đâu. Lệch hướng thì `ctl ... steer "<chỉ dẫn cụ thể>"`, lệch nặng thì `ctl ... interrupt`.
+   - Không thuật lại từng sự kiện cho người dùng. Chỉ báo khi phải duyệt, có sự cố, hoặc khi xong.
+6. **Kiểm chứng độc lập, không tin báo cáo của worker, nhưng vừa đủ:**
+   - Đọc `cx-worker result <dir> --name <tên>` trước, không đọc toàn bộ log của worker.
+   - Kiểm chứng theo tiêu chí hoàn thành và các điểm rủi ro nhất. Không đọc lại mọi thứ worker đã đọc; diff lớn thì xem `git diff --stat` rồi chỉ đọc kỹ các file quan trọng.
    - Chế độ edit: `git diff` (hoặc so với snapshot), chạy lại lệnh kiểm chứng, thử thêm trường hợp biên.
    - Phát hiện, phân tích: chạy lại vài bằng chứng quan trọng nhất.
    - Nghiên cứu: mở lại vài URL trong `sources`.
