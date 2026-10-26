@@ -1,0 +1,31 @@
+#!/bin/sh
+# Kiểm tra máy có đủ công cụ cho /delegate và cài phần cho opencode (nếu có opencode).
+# Chạy lại nhiều lần không sao: chỉ ghi file của chính plugin này.
+set -eu
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+
+ok() { printf '  ✓ %s\n' "$1"; }
+miss() { printf '  ✘ %s\n' "$1"; }
+
+echo "Công cụ:"
+command -v python3 >/dev/null && ok "python3 $(python3 -c 'import sys;print(sys.version.split()[0])')" || miss "python3 (bắt buộc)"
+command -v git >/dev/null && ok "git" || miss "git (bắt buộc)"
+if command -v codex >/dev/null; then
+  ok "codex $(codex --version 2>/dev/null | awk '{print $2}')"
+else
+  miss "codex — cài: curl -fsSL https://chatgpt.com/codex/install.sh | sh, rồi codex login"
+fi
+OPENCODE=$(command -v opencode || ls "$HOME/.opencode/bin/opencode" 2>/dev/null || true)
+if [ -n "$OPENCODE" ]; then
+  ok "opencode $("$OPENCODE" --version 2>/dev/null)"
+  CFG="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
+  mkdir -p "$CFG/agent" "$CFG/plugin"
+  cp "$HERE/opencode/delegate.md" "$CFG/agent/delegate.md"
+  cp "$HERE/opencode/scope-guard.ts" "$CFG/plugin/scope-guard.ts"
+  ok "đã cài agent delegate và plugin scope-guard vào $CFG"
+  if ! [ -d "$CFG/node_modules/@opencode-ai/plugin" ]; then
+    echo "    (lần chạy opencode đầu tiên sẽ tự cài @opencode-ai/plugin)"
+  fi
+else
+  miss "opencode (tuỳ chọn) — cài: curl -fsSL https://opencode.ai/install | bash, rồi opencode auth login"
+fi

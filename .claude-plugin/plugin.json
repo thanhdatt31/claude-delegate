@@ -1,0 +1,5 @@
+{
+  "name": "delegate",
+  "version": "0.1.0",
+  "description": "Claude lập plan rồi giao việc code cho Codex (app-server) hoặc opencode, giám sát từng hành động, ép phạm vi file và tự review kết quả."
+}

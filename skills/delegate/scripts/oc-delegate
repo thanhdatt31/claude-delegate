@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""oc-delegate: Claude giao việc cho opencode và giám sát qua HTTP API của `opencode serve`.
+
+Luồng dùng:
+  oc-delegate start <repo> <plan.md> --allow 'src/**' --allow 'tests/**' [--bash-allow 'npm test*']
+  oc-delegate watch <repo> --until-idle     # stream sự kiện, tự duyệt quyền an toàn, báo phần còn lại
+  oc-delegate perms|approve|deny|todo|diff|last|say|abort|revert <repo> ...
+
+Trạng thái mỗi repo nằm trong <repo>/.delegate/ (scope.json, state.json, audit.jsonl).
+"""
+import argparse
+import fnmatch
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+PORT = int(os.environ.get("OC_DELEGATE_PORT", "4555"))
+BASE = f"http://127.0.0.1:{PORT}"
+OPENCODE = os.environ.get("OPENCODE_BIN") or shutil.which("opencode") or str(Path.home() / ".opencode/bin/opencode")
+LOG_DIR = Path.home() / ".local/state/oc-delegate"
+
+RULES = """\
+Bạn là coder được giao việc. Quy tắc bắt buộc:
+1. Trước khi code, dùng todowrite để chép các bước của plan thành todo list, đúng thứ tự trong plan.
+2. Làm lần lượt từng bước, cập nhật trạng thái todo khi bắt đầu và khi xong mỗi bước.
+3. Chỉ sửa file trong phạm vi: {allow}. File ngoài phạm vi sẽ bị chặn; nếu thật sự cần thì dừng và giải thích.
+4. Không commit, không đổi branch, không cài thêm dependency nếu plan không yêu cầu.
+5. Không làm thêm việc ngoài plan. Thấy plan sai hoặc thiếu thì dừng lại và nói rõ, đừng tự ý đổi hướng.
+6. Kết thúc bằng báo cáo ngắn: đã làm bước nào, file nào đã sửa, lệnh kiểm tra đã chạy và kết quả, chỗ nào lệch plan.
+
+PLAN:
+"""
+
+
+# ---------- HTTP ----------
+
+def api(method, path, repo, body=None, timeout=30):
+    sep = "&" if "?" in path else "?"
+    url = f"{BASE}{path}{sep}directory={urllib.parse.quote(str(repo))}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        sys.exit(f"API {method} {path} -> {e.code}: {e.read().decode()[:500]}")
+    return json.loads(raw) if raw.strip() else None
+
+
+def server_up():
+    try:
+        urllib.request.urlopen(f"{BASE}/doc", timeout=2)
+        return True
+    except Exception:
+        return False
+
+
+def ensure_server():
+    if server_up():
+        return
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log = open(LOG_DIR / "server.log", "ab")
+    subprocess.Popen([OPENCODE, "serve", "--port", str(PORT)], stdin=subprocess.DEVNULL,
+                     stdout=log, stderr=log, start_new_session=True, cwd=str(Path.home()))
+    for _ in range(40):
+        if server_up():
+            return
+        time.sleep(0.5)
+    sys.exit(f"opencode serve không lên được, xem {LOG_DIR / 'server.log'}")
+
+
+# ---------- state ----------
+
+def ddir(repo):
+    return Path(repo) / ".delegate"
+
+
+def load(repo, name, default=None):
+    p = ddir(repo) / name
+    return json.loads(p.read_text()) if p.exists() else default
+
+
+def save(repo, name, obj):
+    ddir(repo).mkdir(exist_ok=True)
+    (ddir(repo) / name).write_text(json.dumps(obj, indent=2, ensure_ascii=False))
+
+
+def session_id(repo):
+    st = load(repo, "state.json")
+    if not st:
+        sys.exit(f"{repo} chưa có phiên nào, chạy `oc-delegate start` trước")
+    return st["session"]
+
+
+def exclude_from_git(repo):
+    exclude = Path(repo) / ".git/info/exclude"
+    if exclude.parent.exists():
+        text = exclude.read_text() if exclude.exists() else ""
+        if ".delegate/" not in text.split():
+            exclude.write_text(text + ("" if text.endswith("\n") or not text else "\n") + ".delegate/\n")
+
+
+# ---------- policy ----------
+
+def glob_match(path, globs):
+    # fnmatch cho '*' khớp cả '/', đủ dùng cho phạm vi kiểu 'src/**'
+    return any(fnmatch.fnmatch(path, g) or fnmatch.fnmatch(path, g.replace("/**", "")) for g in globs)
+
+
+def rel(repo, p):
+    p = Path(p)
+    try:
+        return str(p.resolve().relative_to(Path(repo).resolve())) if p.is_absolute() else str(p)
+    except ValueError:
+        return "../" + str(p)
+
+
+def decide(repo, perm):
+    """Trả về 'once' nếu được tự duyệt, None nếu cần Claude xem."""
+    scope = load(repo, "scope.json", {})
+    kind, patterns = perm.get("permission"), perm.get("patterns") or []
+    if kind == "edit" and patterns:
+        paths = [rel(repo, p) for p in patterns]
+        if all(not p.startswith("..") and glob_match(p, scope.get("allow", []))
+               and not glob_match(p, scope.get("deny", [])) for p in paths):
+            return "once"
+    if kind == "bash" and patterns:
+        if all(any(fnmatch.fnmatch(c, g) for g in scope.get("bash_allow", [])) for c in patterns):
+            return "once"
+    return None
+
+
+# ---------- output ----------
+
+def out(*parts):
+    print(time.strftime("%H:%M:%S"), *parts, flush=True)
+
+
+def short(s, n=160):
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[:n] + "…"
+
+
+def fmt_todos(todos):
+    mark = {"completed": "✔", "in_progress": "▶", "pending": "·", "cancelled": "✘"}
+    return "\n".join(f"         {mark.get(t['status'], '?')} {t['content']}" for t in todos)
+
+
+def last_text(repo, sid):
+    msgs = api("GET", f"/session/{sid}/message", repo) or []
+    for m in reversed(msgs):
+        if m.get("info", {}).get("role") == "assistant":
+            texts = [p.get("text", "") for p in m.get("parts", []) if p.get("type") == "text"]
+            if any(t.strip() for t in texts):
+                return "\n".join(texts).strip()
+    return ""
+
+
+# ---------- commands ----------
+
+def cmd_start(a):
+    repo = str(Path(a.repo).resolve())
+    plan = Path(a.plan).read_text()
+    if not a.allow:
+        sys.exit("cần ít nhất một --allow để giới hạn phạm vi file")
+    save(repo, "scope.json", {"allow": a.allow, "deny": a.deny, "bash_allow": a.bash_allow})
+    exclude_from_git(repo)
+    ensure_server()
+    provider, model = a.model.split("/", 1)
+    sess = api("POST", "/session", repo, {"title": a.title or f"delegate: {Path(a.plan).name}", "agent": "delegate"})
+    sid = sess["id"]
+    save(repo, "state.json", {"session": sid, "model": a.model, "variant": a.variant, "started": time.time()})
+    prompt = RULES.format(allow=", ".join(a.allow)) + plan
+    api("POST", f"/session/{sid}/prompt_async", repo, {
+        "agent": "delegate", "model": {"providerID": provider, "modelID": model}, "variant": a.variant,
+        "parts": [{"type": "text", "text": prompt}],
+    })
+    out(f"đã giao việc: session={sid} model={a.model}/{a.variant} scope={a.allow}")
+
+
+def cmd_watch(a):
+    repo = str(Path(a.repo).resolve())
+    sid = session_id(repo)
+    ensure_server()
+    seen_busy, printed = False, set()
+    # duyệt luôn những yêu cầu đã treo từ trước khi watch bắt đầu
+    for p in api("GET", "/permission", repo) or []:
+        if p.get("sessionID") == sid:
+            handle_perm(repo, p)
+    url = f"{BASE}/event?directory={urllib.parse.quote(repo)}"
+    with urllib.request.urlopen(url) as stream:
+        for raw in stream:
+            line = raw.decode(errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            try:
+                ev = json.loads(line[5:])
+            except json.JSONDecodeError:
+                continue
+            t, pr = ev.get("type"), ev.get("properties", {})
+            if (pr.get("sessionID") or pr.get("part", {}).get("sessionID") or pr.get("info", {}).get("sessionID")) not in (sid, None):
+                continue
+            if t == "message.part.updated":
+                part = pr["part"]
+                if part.get("type") != "tool":
+                    continue
+                st = part["state"]
+                key = (part["callID"], st["status"])
+                if key in printed or st["status"] == "pending":
+                    continue
+                printed.add(key)
+                inp = st.get("input", {})
+                desc = inp.get("command") or inp.get("filePath") or inp.get("pattern") or st.get("title") or ""
+                if st["status"] == "running":
+                    out(f"→ {part['tool']}: {short(desc)}")
+                elif st["status"] == "error":
+                    out(f"✘ {part['tool']} lỗi: {short(st.get('error', ''), 300)}")
+                elif a.verbose and st["status"] == "completed":
+                    out(f"✔ {part['tool']}: {short(st.get('output', ''), 200)}")
+            elif t == "todo.updated":
+                out("TODO\n" + fmt_todos(pr.get("todos", [])))
+            elif t == "file.edited":
+                out(f"✎ sửa {rel(repo, pr.get('file', ''))}")
+            elif t == "permission.asked":
+                handle_perm(repo, pr)
+            elif t == "session.error":
+                out(f"‼ lỗi phiên: {short(json.dumps(pr.get('error'), ensure_ascii=False), 400)}")
+            elif t == "session.status":
+                status = pr.get("status", {}).get("type")
+                if status == "busy":
+                    seen_busy = True
+                elif status == "idle" and seen_busy:
+                    out("■ opencode đã dừng. Báo cáo cuối:\n" + last_text(repo, sid))
+                    if a.until_idle:
+                        return
+                    seen_busy = False
+
+
+def handle_perm(repo, p):
+    verdict = decide(repo, p)
+    what = f"{p.get('permission')} {short(' | '.join(p.get('patterns') or []), 200)}"
+    if verdict:
+        api("POST", f"/permission/{p['id']}/reply", repo, {"reply": verdict})
+        out(f"✓ tự duyệt {what}")
+    else:
+        out(f"⚠ CẦN DUYỆT {p['id']}: {what}")
+
+
+def cmd_perms(a):
+    repo = str(Path(a.repo).resolve())
+    sid = session_id(repo)
+    for p in api("GET", "/permission", repo) or []:
+        if p.get("sessionID") == sid:
+            print(p["id"], p["permission"], json.dumps(p.get("patterns"), ensure_ascii=False),
+                  short(json.dumps(p.get("metadata"), ensure_ascii=False), 400))
+
+
+def cmd_reply(a, reply):
+    repo = str(Path(a.repo).resolve())
+    body = {"reply": reply}
+    if getattr(a, "message", None):
+        body["message"] = a.message
+    api("POST", f"/permission/{a.id}/reply", repo, body)
+    out(f"{reply}: {a.id}")
+
+
+def cmd_todo(a):
+    repo = str(Path(a.repo).resolve())
+    print(fmt_todos(api("GET", f"/session/{session_id(repo)}/todo", repo) or []))
+
+
+def cmd_diff(a):
+    repo = str(Path(a.repo).resolve())
+    for f in api("GET", f"/session/{session_id(repo)}/diff", repo) or []:
+        print(f"{f.get('file')}  +{f.get('additions', '?')} -{f.get('deletions', '?')}")
+
+
+def cmd_last(a):
+    repo = str(Path(a.repo).resolve())
+    print(last_text(repo, session_id(repo)))
+
+
+def cmd_say(a):
+    repo = str(Path(a.repo).resolve())
+    sid = session_id(repo)
+    st = load(repo, "state.json")
+    provider, model = st["model"].split("/", 1)
+    api("POST", f"/session/{sid}/prompt_async", repo, {
+        "agent": "delegate", "model": {"providerID": provider, "modelID": model}, "variant": st["variant"],
+        "parts": [{"type": "text", "text": a.message}],
+    })
+    out("đã gửi chỉ dẫn")
+
+
+def cmd_abort(a):
+    repo = str(Path(a.repo).resolve())
+    api("POST", f"/session/{session_id(repo)}/abort", repo)
+    out("đã dừng phiên")
+
+
+def cmd_revert(a):
+    repo = str(Path(a.repo).resolve())
+    api("POST", f"/session/{session_id(repo)}/revert", repo, {"messageID": a.message_id})
+    out(f"đã revert về trước {a.message_id}")
+
+
+def cmd_messages(a):
+    repo = str(Path(a.repo).resolve())
+    for m in api("GET", f"/session/{session_id(repo)}/message", repo) or []:
+        info = m.get("info", {})
+        text = " ".join(p.get("text", "") for p in m.get("parts", []) if p.get("type") == "text")
+        tools = [p.get("tool") for p in m.get("parts", []) if p.get("type") == "tool"]
+        print(info.get("id"), info.get("role"), f"tools={tools}" if tools else "", short(text, 200))
+
+
+def cmd_server(a):
+    if a.action == "start":
+        ensure_server()
+        print(f"server chạy ở {BASE}")
+    elif a.action == "stop":
+        subprocess.run(["pkill", "-f", f"opencode serve --port {PORT}"])
+        print("đã tắt server")
+    else:
+        print("up" if server_up() else "down")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("start", help="tạo phiên và giao plan")
+    s.add_argument("repo"); s.add_argument("plan")
+    s.add_argument("--allow", action="append", default=[], help="glob file được sửa (lặp lại được)")
+    s.add_argument("--deny", action="append", default=[], help="glob file cấm sửa")
+    s.add_argument("--bash-allow", action="append", default=[], help="lệnh bash tự duyệt, vd 'npm test*'")
+    s.add_argument("--model", default="openai/gpt-6.1-sol")
+    s.add_argument("--variant", default="high")
+    s.add_argument("--title")
+    s.set_defaults(fn=cmd_start)
+
+    w = sub.add_parser("watch", help="stream sự kiện và tự duyệt quyền an toàn")
+    w.add_argument("repo"); w.add_argument("--until-idle", action="store_true"); w.add_argument("-v", "--verbose", action="store_true")
+    w.set_defaults(fn=cmd_watch)
+
+    for name, fn in [("perms", cmd_perms), ("todo", cmd_todo), ("diff", cmd_diff), ("last", cmd_last),
+                     ("abort", cmd_abort), ("messages", cmd_messages)]:
+        p = sub.add_parser(name); p.add_argument("repo"); p.set_defaults(fn=fn)
+
+    p = sub.add_parser("approve"); p.add_argument("repo"); p.add_argument("id")
+    p.add_argument("--always", action="store_true")
+    p.set_defaults(fn=lambda a: cmd_reply(a, "always" if a.always else "once"))
+    p = sub.add_parser("deny"); p.add_argument("repo"); p.add_argument("id"); p.add_argument("message", nargs="?")
+    p.set_defaults(fn=lambda a: cmd_reply(a, "reject"))
+    p = sub.add_parser("say", help="gửi thêm chỉ dẫn vào phiên"); p.add_argument("repo"); p.add_argument("message")
+    p.set_defaults(fn=cmd_say)
+    p = sub.add_parser("revert"); p.add_argument("repo"); p.add_argument("message_id"); p.set_defaults(fn=cmd_revert)
+    p = sub.add_parser("server"); p.add_argument("action", choices=["start", "stop", "status"]); p.set_defaults(fn=cmd_server)
+
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
