@@ -1,5 +1,12 @@
 {
   "name": "claude-delegate",
-  "owner": { "name": "thanhdatt31" },
-  "plugins": [{ "name": "delegate", "source": "./" }]
+  "owner": {
+    "name": "thanhdatt31"
+  },
+  "plugins": [
+    {
+      "name": "worker",
+      "source": "./"
+    }
+  ]
 }

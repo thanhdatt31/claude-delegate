@@ -1,19 +1,26 @@
-# delegate
+# worker
 
-Plugin Claude Code cho quy trình "Claude lập plan, đệ code, Claude giám sát". Claude đọc code, viết plan kèm phạm vi file và lệnh kiểm chứng. Sau khi bạn duyệt plan, Claude giao việc cho **Codex** (mặc định, qua `codex app-server`) hoặc **opencode** (qua `opencode serve`). Trong lúc đệ làm, Claude theo dõi từng hành động: tự duyệt các lần sửa file trong phạm vi và các lệnh đã cho phép, từ chối mọi thứ ngoài phạm vi, chen chỉ dẫn khi đệ đi lệch. Cuối cùng Claude tự review diff và chạy lại test, không dựa vào báo cáo của đệ.
+Plugin Claude Code biến **Codex thành worker** cho Claude. Claude hiểu việc, viết nhiệm vụ kèm tiêu chí hoàn thành, rồi giao cho Codex chạy qua `codex app-server`. Trong lúc worker làm, Claude theo dõi từng hành động: tự duyệt những gì an toàn và trong phạm vi, từ chối phần còn lại, chen chỉ dẫn khi worker đi lệch. Xong việc, Claude tự kiểm chứng kết quả chứ không dựa vào báo cáo của worker.
+
+Không chỉ cho code:
+- **read**: điều tra lỗi, phân tích log, review, khảo sát codebase. Sandbox chỉ đọc, nhanh, không cần duyệt.
+- **edit**: sửa code, viết tài liệu, làm sạch dữ liệu, sắp xếp file. Mọi lần sửa phải nằm trong phạm vi glob. Thư mục không phải git thì có snapshot để khôi phục.
+- **--network**: tìm web và truy cập mạng cho việc nghiên cứu.
+
+Kết quả trả về dạng JSON có cấu trúc (findings kèm bằng chứng, file đã đổi, kiểm tra đã chạy, nguồn). Chạy được nhiều worker song song. opencode được hỗ trợ làm backend phụ.
 
 ## Cài đặt
 
 Trong một phiên Claude Code ở terminal:
 
 ```
-/plugin install delegate --marketplace thanhdatt31/claude-delegate
+/plugin install worker --marketplace thanhdatt31/claude-delegate
 ```
 
 Hoặc từ shell:
 
 ```
-claude plugin install delegate --marketplace thanhdatt31/claude-delegate
+claude plugin install worker --marketplace thanhdatt31/claude-delegate
 ```
 
 Trả lời `y` để thêm marketplace, rồi chọn scope (mặc định là user).
@@ -26,22 +33,22 @@ Trong app desktop: bấm + cạnh ô nhập, chọn Plugins, Add marketplace v�
 - **Codex CLI**: `curl -fsSL https://chatgpt.com/codex/install.sh | sh`, rồi `codex login`.
 - **opencode** (tuỳ chọn): `curl -fsSL https://opencode.ai/install | bash`, rồi `opencode auth login`.
 
-Lần đầu dùng, Claude chạy `scripts/setup` để kiểm tra máy và cài agent `delegate` cùng plugin `scope-guard` vào `~/.config/opencode` (nếu có opencode).
+Lần đầu dùng, Claude chạy `scripts/setup` để kiểm tra máy và cài phần cho opencode (nếu có).
 
 ## Cách dùng
 
 ```
-/delegate sửa bug X trong repo này, thêm test
-/delegate opencode thêm endpoint Y
+/worker tìm nguyên nhân test X fail, chỉ đọc
+/worker làm sạch data/sales.csv thành clean.csv và viết báo cáo
+/worker nghiên cứu 3 thư viện queue cho Python, có nguồn --network
 ```
 
-Hoặc chỉ cần nói "giao cho codex làm task này".
+Hoặc chỉ cần nói "giao cho codex làm việc này".
 
 ## Thành phần
 
-- `skills/delegate/SKILL.md`: quy trình cho Claude.
-- `skills/delegate/scripts/cx-delegate`: điều khiển Codex qua app-server (duyệt sửa file và lệnh, `steer`, `interrupt`, `resume`).
-- `skills/delegate/scripts/oc-delegate`: điều khiển opencode qua HTTP API (duyệt quyền, todo, diff, abort, revert).
-- `skills/delegate/opencode/`: agent `delegate` và plugin `scope-guard` cho opencode.
-
-Trạng thái mỗi lần giao việc nằm trong `<repo>/.delegate/`, thư mục này tự được thêm vào `.git/info/exclude`.
+- `skills/worker/SKILL.md`: quy trình cho Claude.
+- `skills/worker/scripts/cx-worker`: điều khiển Codex (`run`, `resume`, `ctl approve|deny|steer|interrupt|quit`, `result`, `list`, `restore`).
+- `skills/worker/scripts/oc-delegate`: backend opencode.
+- `skills/worker/opencode/`: agent `delegate` và plugin `scope-guard` cho opencode.
+- `skills/worker/scripts/setup`: kiểm tra và cài đặt.
