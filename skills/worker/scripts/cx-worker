@@ -7,13 +7,15 @@
       hành động khác in "⚠ CẦN DUYỆT <key>" và chờ lệnh ctl. Kết thúc khi worker xong turn.
   cx-worker resume <dir> --name N "<chỉ dẫn>"      thêm một turn vào thread cũ (giữ ngữ cảnh)
   cx-worker ctl <dir> --name N approve <key> | deny <key> | steer "<msg>" | interrupt | quit
-  cx-worker result <dir> --name N                  in kết quả cuối (JSON nếu có schema)
+  cx-worker result <dir> --name N [--brief]        in kết quả cuối (JSON nếu có schema)
+  cx-worker log <dir> --name N [-n 15]             các sự kiện gần nhất (stdout của run chỉ in dòng cần hành động)
   cx-worker list [<dir>]                           liệt kê worker và trạng thái
   cx-worker restore <dir> --name N                 khôi phục file trong phạm vi về lúc trước khi giao
 
 Mode:
   read  sandbox chỉ đọc, không sửa được gì. Hợp cho điều tra, phân tích, review, nghiên cứu.
   edit  sandbox ghi trong <dir>; mỗi lần sửa file phải nằm trong --allow, ngoài phạm vi bị từ chối.
+  edit --trust  không duyệt từng lệnh; snapshot cả <dir>, khi xong tự hoàn tác mọi thay đổi ngoài --allow.
 --network bật tìm web (live) và cho lệnh trong sandbox truy cập mạng.
 
 Trạng thái nằm ngoài <dir>: ${XDG_STATE_HOME:-~/.local/state}/cx-worker/<dir-slug>/<name>/.
@@ -45,7 +47,8 @@ Bạn là worker được Claude giao việc. Quy tắc bắt buộc:
 3. {scope_rule}
 4. Không commit, không đổi branch, không cài đặt gì nếu nhiệm vụ không yêu cầu.
 5. Mọi khẳng định phải có bằng chứng: đường dẫn file:dòng, output lệnh, hoặc URL nguồn.
-6. {output_rule}
+6. Nếu nhiệm vụ có lệnh hay tiêu chí kiểm chứng: tự chạy. Không đạt thì sửa rồi chạy lại, tối đa {max_iter} vòng. Ghi số vòng vào `iterations` và kết quả lần chạy cuối vào `checks`.
+7. {output_rule}
 
 NHIỆM VỤ:
 """
@@ -53,9 +56,11 @@ NHIỆM VỤ:
 DEFAULT_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["status", "summary", "findings", "files_changed", "checks", "sources", "deviations", "next_steps"],
+    "required": ["status", "summary", "findings", "files_changed", "checks", "iterations", "sources", "deviations",
+                 "next_steps"],
     "properties": {
         "status": {"type": "string", "enum": ["done", "partial", "blocked"]},
+        "iterations": {"type": "integer", "description": "Số vòng sửa rồi kiểm chứng lại (0 nếu không có)"},
         "summary": {"type": "string", "description": "Tóm tắt kết quả, 1-5 câu"},
         "findings": {"type": "array", "items": {
             "type": "object", "additionalProperties": False, "required": ["title", "detail", "evidence"],
@@ -82,8 +87,19 @@ SAFE_CMDS = ["ls*", "pwd", "cat *", "git status*", "git diff*", "git log*", "git
 
 # ---------- tiện ích ----------
 
-def out(*parts):
-    print(time.strftime("%H:%M:%S"), *parts, flush=True)
+LOG = None
+VERBOSE = False
+
+
+def out(*parts, show=False):
+    """Mọi dòng ghi vào log của worker; chỉ dòng cần Claude hành động (show=True) mới ra stdout,
+    vì stdout là thứ Claude đọc và mỗi dòng ở đó tốn token."""
+    line = " ".join([time.strftime("%H:%M:%S")] + [str(p) for p in parts])
+    if LOG:
+        LOG.write(line + "\n")
+        LOG.flush()
+    if show or VERBOSE or not LOG:
+        print(line, flush=True)
 
 
 def short(s, n=160):
@@ -167,24 +183,61 @@ def rel(root, p):
 
 # ---------- snapshot cho mode edit ----------
 
-def take_snapshot(target, d, allow, deny):
+SKIP_DIRS = (".git", "node_modules", ".venv", "__pycache__")
+
+
+def walk_files(target):
+    for root, dirs, names in os.walk(target):
+        dirs[:] = [x for x in dirs if x not in SKIP_DIRS]
+        for n in names:
+            yield rel(target, os.path.join(root, n))
+
+
+def sha1(path):
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def take_snapshot(target, d, allow, deny, full=False):
+    """Chép lại file trước khi giao việc. full=True chép cả thư mục (dùng cho --trust, để phát hiện
+    và hoàn tác mọi thay đổi ngoài phạm vi); ngược lại chỉ chép file trong phạm vi."""
     snap = d / "snapshot"
     shutil.rmtree(snap, ignore_errors=True)
-    files, total = [], 0
-    for root, dirs, names in os.walk(target):
-        dirs[:] = [x for x in dirs if x not in (".git", "node_modules", ".venv", "__pycache__")]
-        for n in names:
-            r = rel(target, os.path.join(root, n))
-            if glob_match(r, allow) and not glob_match(r, deny):
-                total += os.path.getsize(os.path.join(root, n))
-                files.append(r)
+    files = [r for r in walk_files(target) if full or (glob_match(r, allow) and not glob_match(r, deny))]
+    total = sum(os.path.getsize(Path(target) / r) for r in files)
     if total > SNAPSHOT_LIMIT:
-        out(f"⚠ phạm vi quá lớn ({total // 1024 // 1024}MB), bỏ qua snapshot; hãy dùng git để khôi phục")
-        return
+        return False
+    manifest = {}
     for r in files:
         (snap / r).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(Path(target) / r, snap / r)
-    save(d, "snapshot.json", {"files": files, "allow": allow, "deny": deny, "time": time.time()})
+        manifest[r] = sha1(snap / r)
+    save(d, "snapshot.json", {"files": manifest, "allow": allow, "deny": deny, "full": full, "time": time.time()})
+    return True
+
+
+def enforce_scope(target, d, scope):
+    """--trust: worker chạy không cần duyệt; sau khi xong, mọi file bị thêm, sửa hay xoá ngoài phạm vi
+    được khôi phục từ snapshot. Trả về danh sách file đã hoàn tác."""
+    meta = load(d, "snapshot.json")
+    before = meta["files"]
+    now = set(walk_files(target))
+    reverted = []
+    for r in sorted(now | set(before)):
+        abs_path = Path(target) / r
+        changed = r not in before or r not in now or sha1(abs_path) != before[r]
+        if not changed or (glob_match(r, scope["allow"]) and not glob_match(r, scope["deny"])):
+            continue
+        if r in before:
+            abs_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(d / "snapshot" / r, abs_path)
+        else:
+            abs_path.unlink()
+        reverted.append(r)
+    return reverted
 
 
 # ---------- controller ----------
@@ -196,6 +249,8 @@ class Controller:
         self.inbox.mkdir(parents=True, exist_ok=True)
         for f in self.inbox.iterdir():
             f.unlink()
+        global LOG
+        LOG = open(d / "log.txt", "a")
         log = open(d / "server.log", "ab")
         self.proc = subprocess.Popen([CODEX, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=log, text=True, bufsize=1, cwd=target)
@@ -253,7 +308,7 @@ class Controller:
         except queue.Empty:
             return
         if m is None:
-            out("‼ codex app-server đã thoát")
+            out("‼ codex app-server đã thoát", show=True)
             self.done = True
             return
         if "id" in m and "method" not in m:
@@ -261,7 +316,7 @@ class Controller:
             if cb:
                 cb(m)
             elif "error" in m:
-                out(f"‼ lỗi: {short(m['error'], 300)}")
+                out(f"‼ lỗi: {short(m['error'], 300)}", show=True)
         elif "id" in m:
             self.on_server_request(m)
         else:
@@ -301,7 +356,7 @@ class Controller:
                 bad = [x for x in (rel(self.target, c["path"]) for c in item.get("changes", [])) if not self.in_scope(x)]
                 if bad:
                     # Lớp dự phòng: lần sửa ngoài phạm vi đã được ghi mà không qua bước duyệt.
-                    out(f"‼ đã sửa ngoài phạm vi mà không qua duyệt: {bad} — dừng turn")
+                    out(f"‼ đã sửa ngoài phạm vi mà không qua duyệt: {bad} — dừng turn", show=True)
                     self.interrupt()
             elif t == "fileChange" and item.get("status") not in ("completed", None):
                 out(f"✘ sửa file {item.get('status')}")
@@ -316,7 +371,8 @@ class Controller:
             status = p.get("turn", {}).get("status")
             self.finish(status)
         elif method == "error":
-            out(f"‼ lỗi: {short(json.dumps(p, ensure_ascii=False), 400)}")
+            # Lỗi Codex sẽ tự thử lại (mất kết nối tạm thời...) chỉ ghi log, không làm phiền Claude.
+            out(f"‼ lỗi: {short(json.dumps(p, ensure_ascii=False), 400)}", show=not p.get("willRetry"))
 
     def finish(self, status):
         text = self.last_message
@@ -325,10 +381,15 @@ class Controller:
             result = json.loads(text)
         except (json.JSONDecodeError, TypeError):
             pass
-        save(self.d, "result.json", {"turn_status": status, "result": result, "text": None if result else text})
+        reverted = enforce_scope(self.target, self.d, self.scope) if self.scope.get("trust") else []
+        save(self.d, "result.json", {"turn_status": status, "result": result, "text": None if result else text,
+                                     "scope_reverted": reverted})
         self.status(status or "completed")
-        body = json.dumps(result, indent=2, ensure_ascii=False) if result else text
-        out(f"■ worker xong turn ({status}). Kết quả:\n{body}")
+        name = load(self.d, "state.json", {}).get("name", "main")
+        out(f"■ worker '{name}' xong ({status}): {brief(result, text)}", show=True)
+        if reverted:
+            out(f"‼ đã hoàn tác {len(reverted)} file bị đổi ngoài phạm vi: {', '.join(reverted[:10])}", show=True)
+        out(f"  chi tiết: cx-worker result {self.target} --name {name}", show=True)
         self.turn_id = None
         self.done = True
 
@@ -351,7 +412,7 @@ class Controller:
                 out(f"✓ tự duyệt sửa {', '.join(paths)}")
             elif paths:
                 self.reply(rid, {"decision": "decline"})
-                out(f"✘ từ chối sửa ngoài phạm vi: {', '.join(paths)}")
+                out(f"✘ từ chối sửa ngoài phạm vi: {', '.join(paths)}", show=True)
             else:
                 self.escalate(rid, method, f"sửa file (không rõ path) {short(p.get('reason'))}")
         elif method in ("item/commandExecution/requestApproval", "execCommandApproval"):
@@ -362,7 +423,7 @@ class Controller:
             verdict = classify(cmd, SAFE_CMDS + self.scope.get("bash_allow", []))
             if verdict == "deny":
                 self.reply(rid, {"decision": "decline"})
-                out(f"✘ từ chối lệnh cấm: {short(cmd)}")
+                out(f"✘ từ chối lệnh cấm: {short(cmd)}", show=True)
             elif verdict == "allow" and not p.get("networkApprovalContext"):
                 self.reply(rid, {"decision": "accept"})
                 out(f"✓ tự duyệt bash {short(cmd)}")
@@ -376,7 +437,7 @@ class Controller:
         key = uuid.uuid4().hex[:6]
         self.pending[key] = (rid, method, desc)
         self.status("waiting-approval")
-        out(f"⚠ CẦN DUYỆT {key}: {desc}")
+        out(f"⚠ CẦN DUYỆT {key}: {desc}", show=True)
 
     # ---------- điều khiển từ Claude ----------
     def check_inbox(self):
@@ -394,7 +455,7 @@ class Controller:
         if op in ("approve", "deny"):
             entry = self.pending.pop(c["key"], None)
             if not entry:
-                out(f"không có yêu cầu {c['key']}")
+                out(f"không có yêu cầu {c['key']}", show=True)
                 return
             rid, method, desc = entry
             if method.endswith("requestApproval") or method in ("applyPatchApproval", "execCommandApproval"):
@@ -403,14 +464,14 @@ class Controller:
                 self.send({"id": rid, "error": {"code": -32000, "message": "declined by controller"}})
             if not self.pending:
                 self.status("running")
-            out(f"{'✓ đã duyệt' if op == 'approve' else '✘ đã từ chối'} {c['key']}: {desc}")
+            out(f"{'✓ đã duyệt' if op == 'approve' else '✘ đã từ chối'} {c['key']}: {desc}", show=True)
         elif op == "steer":
             if not self.turn_id:
-                out("không có turn đang chạy để steer")
+                out("không có turn đang chạy để steer", show=True)
                 return
             self.request("turn/steer", {"threadId": self.thread_id, "expectedTurnId": self.turn_id,
                                         "input": [{"type": "text", "text": c["text"]}]})
-            out(f"↪ steer: {short(c['text'])}")
+            out(f"↪ steer: {short(c['text'])}", show=True)
         elif op == "interrupt":
             self.interrupt()
         elif op == "quit":
@@ -420,7 +481,23 @@ class Controller:
     def interrupt(self):
         if self.turn_id:
             self.request("turn/interrupt", {"threadId": self.thread_id, "turnId": self.turn_id})
-            out("⏹ đã gửi interrupt")
+            out("⏹ đã gửi interrupt", show=True)
+
+
+def brief(result, text=""):
+    """Một dòng tóm tắt kết quả: đủ để Claude quyết định có cần đọc chi tiết hay không."""
+    if not result:
+        return short(text, 300)
+    checks = "; ".join(f"{c['check']}: {short(c['result'], 60)}" for c in result.get("checks", [])[:3])
+    parts = [f"status={result.get('status')}", short(result.get("summary", ""), 300),
+             f"{len(result.get('findings', []))} findings", f"files={result.get('files_changed', [])}"]
+    if result.get("iterations"):
+        parts.append(f"iterations={result['iterations']}")
+    if checks:
+        parts.append(f"checks: {checks}")
+    if result.get("deviations"):
+        parts.append(f"deviations={len(result['deviations'])}")
+    return " | ".join(parts)
 
 
 def thread_config(scope):
@@ -467,32 +544,44 @@ def cmd_run(a):
         schema = json.loads(Path(a.schema).read_text())
     else:
         schema = DEFAULT_SCHEMA
-    scope = {"mode": a.mode, "allow": a.allow, "deny": a.deny, "bash_allow": a.bash_allow, "network": a.network}
+    if a.trust and a.mode != "edit":
+        sys.exit("--trust chỉ dùng với --mode edit")
+    global VERBOSE
+    VERBOSE = a.verbose
+    scope = {"mode": a.mode, "allow": a.allow, "deny": a.deny, "bash_allow": a.bash_allow, "network": a.network,
+             "trust": a.trust}
     shutil.rmtree(d, ignore_errors=True)
     save(d, "scope.json", scope)
     (d / "task.md").write_text(task)
-    if a.mode == "edit":
-        take_snapshot(target, d, a.allow, a.deny)
+    if a.mode == "edit" and not take_snapshot(target, d, a.allow, a.deny, full=a.trust):
+        if a.trust:
+            shutil.rmtree(d, ignore_errors=True)
+            sys.exit(f"--trust cần snapshot toàn thư mục nhưng thư mục lớn hơn {SNAPSHOT_LIMIT // 1024 // 1024}MB; "
+                     "bỏ --trust hoặc giao việc trong thư mục con nhỏ hơn")
+        print("⚠ phạm vi quá lớn, bỏ qua snapshot; hãy dùng git để khôi phục", flush=True)
     scope_rule = ("Đây là việc CHỈ ĐỌC: không tạo, sửa hay xoá file nào." if a.mode == "read" else
-                  f"Chỉ sửa file trong phạm vi: {', '.join(a.allow)}. Sửa ngoài phạm vi sẽ bị từ chối; nếu thật sự cần thì dừng và giải thích.")
+                  f"Chỉ sửa file trong phạm vi: {', '.join(a.allow)}. Thay đổi ngoài phạm vi sẽ bị từ chối hoặc hoàn tác; "
+                  "nếu thật sự cần thì dừng và giải thích.")
     output_rule = ("Câu trả lời cuối cùng phải là JSON đúng schema được cung cấp, không thêm chữ nào ngoài JSON." if schema else
                    "Kết thúc bằng báo cáo ngắn: đã làm gì, bằng chứng, kiểm tra đã chạy, chỗ nào lệch nhiệm vụ.")
-    text = RULES.format(scope_rule=scope_rule, output_rule=output_rule) + task
+    text = RULES.format(scope_rule=scope_rule, output_rule=output_rule, max_iter=a.max_iter) + task
 
     c = start_controller(target, d, scope)
+    # read: sandbox chỉ đọc đã chặn mọi thao tác ghi. edit --trust: sandbox giới hạn ghi trong <dir>, và
+    # enforce_scope hoàn tác mọi thay đổi ngoài phạm vi khi xong. Cả hai đều không cần duyệt từng lệnh.
+    no_approvals = a.mode == "read" or a.trust
     r = c.call("thread/start", {
         "cwd": target, "model": a.model,
         "sandbox": "read-only" if a.mode == "read" else "workspace-write",
-        # read: sandbox chỉ đọc đã chặn mọi thao tác ghi, nên không cần duyệt từng lệnh.
-        "approvalPolicy": "never" if a.mode == "read" else "untrusted", "config": thread_config(scope)})
+        "approvalPolicy": "never" if no_approvals else "untrusted", "config": thread_config(scope)})
     c.thread_id = r["thread"]["id"]
     st = {"thread": c.thread_id, "target": target, "name": a.name, "model": a.model, "effort": a.effort,
           "mode": a.mode, "schema": schema, "started": time.time()}
     save(d, "state.json", st)
     c.call("turn/start", turn_params(c, st, text))
     net = " +network" if a.network else ""
-    scope_desc = "chỉ đọc" if a.mode == "read" else f"sửa {a.allow}"
-    out(f"đã giao việc cho worker '{a.name}': {a.model}/{a.effort}, {scope_desc}{net}, thread={c.thread_id}")
+    scope_desc = "chỉ đọc" if a.mode == "read" else f"sửa {a.allow}" + (" (trust)" if a.trust else "")
+    out(f"đã giao việc cho worker '{a.name}': {a.model}/{a.effort}, {scope_desc}{net}", show=True)
     run_loop(c)
 
 
@@ -509,7 +598,7 @@ def cmd_resume(a):
     if st.get("schema"):
         text += "\n\n(Câu trả lời cuối cùng vẫn phải là JSON đúng schema.)"
     c.call("turn/start", turn_params(c, st, text))
-    out(f"đã gửi turn mới cho worker '{a.name}'")
+    out(f"đã gửi turn mới cho worker '{a.name}'", show=True)
     run_loop(c)
 
 
@@ -530,7 +619,19 @@ def cmd_ctl(a):
 
 def cmd_result(a):
     r = load(wdir(a.dir, a.name), "result.json") or sys.exit("chưa có kết quả")
-    print(json.dumps(r["result"], indent=2, ensure_ascii=False) if r.get("result") else r.get("text", ""))
+    res = r.get("result")
+    if a.brief and res:
+        res = {k: res.get(k) for k in ("status", "summary", "files_changed", "checks", "iterations", "deviations")}
+        res["findings"] = [f["title"] for f in r["result"].get("findings", [])]
+    if r.get("scope_reverted"):
+        print(f"‼ đã hoàn tác ngoài phạm vi: {r['scope_reverted']}")
+    print(json.dumps(res, indent=2, ensure_ascii=False) if res else r.get("text", ""))
+
+
+def cmd_log(a):
+    p = wdir(a.dir, a.name) / "log.txt"
+    lines = p.read_text().splitlines() if p.exists() else sys.exit("chưa có log")
+    print("\n".join(lines[-a.n:]))
 
 
 def cmd_list(a):
@@ -557,13 +658,11 @@ def cmd_restore(a):
         shutil.copy2(snap / r, dst)
         restored += 1
     keep = set(meta["files"])
-    for root, dirs, names in os.walk(target):
-        dirs[:] = [x for x in dirs if x not in (".git", "node_modules", ".venv")]
-        for n in names:
-            r = rel(target, os.path.join(root, n))
-            if r not in keep and glob_match(r, meta["allow"]) and not glob_match(r, meta["deny"]):
-                os.remove(os.path.join(root, n))
-                removed += 1
+    for r in list(walk_files(target)):
+        in_scope = meta.get("full") or (glob_match(r, meta["allow"]) and not glob_match(r, meta["deny"]))
+        if r not in keep and in_scope:
+            os.remove(Path(target) / r)
+            removed += 1
     print(f"đã khôi phục {restored} file, xoá {removed} file mới tạo trong phạm vi")
 
 
@@ -590,8 +689,12 @@ def main():
     r.add_argument("--bash-allow", action="append", default=[], help="lệnh tự duyệt, vd 'npm test*'")
     r.add_argument("--network", action="store_true", help="bật tìm web và mạng trong sandbox")
     r.add_argument("--schema", help="file JSON Schema cho kết quả; 'none' để trả lời tự do")
+    r.add_argument("--trust", action="store_true",
+                   help="mode edit không duyệt từng lệnh; khi xong tự hoàn tác mọi thay đổi ngoài --allow")
+    r.add_argument("--max-iter", type=int, default=3, help="số vòng tự sửa và kiểm chứng lại tối đa")
     r.add_argument("--model", default="gpt-6.1-sol")
     r.add_argument("--effort", default="high")
+    r.add_argument("-v", "--verbose", action="store_true", help="in mọi sự kiện ra stdout (mặc định chỉ ghi log)")
     r.set_defaults(fn=cmd_run)
 
     p = sub.add_parser("resume", help="thêm một turn vào thread cũ")
@@ -603,9 +706,18 @@ def main():
     p.add_argument("arg", nargs="?"); p.add_argument("--name", default="main")
     p.set_defaults(fn=cmd_ctl)
 
-    for name, fn in [("result", cmd_result), ("restore", cmd_restore)]:
-        p = sub.add_parser(name); p.add_argument("dir"); p.add_argument("--name", default="main")
-        p.set_defaults(fn=fn)
+    p = sub.add_parser("result", help="kết quả cuối của worker")
+    p.add_argument("dir"); p.add_argument("--name", default="main")
+    p.add_argument("--brief", action="store_true", help="chỉ status, summary, tiêu đề findings, checks")
+    p.set_defaults(fn=cmd_result)
+
+    p = sub.add_parser("log", help="các sự kiện gần nhất của worker")
+    p.add_argument("dir"); p.add_argument("--name", default="main"); p.add_argument("-n", type=int, default=15)
+    p.set_defaults(fn=cmd_log)
+
+    p = sub.add_parser("restore", help="khôi phục file về lúc trước khi giao việc")
+    p.add_argument("dir"); p.add_argument("--name", default="main")
+    p.set_defaults(fn=cmd_restore)
 
     p = sub.add_parser("list"); p.add_argument("dir", nargs="?"); p.set_defaults(fn=cmd_list)
 

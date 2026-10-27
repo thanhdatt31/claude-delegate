@@ -4,10 +4,10 @@ Plugin Claude Code biến **Codex thành worker** cho Claude. Claude hiểu vi�
 
 Không chỉ cho code:
 - **read**: điều tra lỗi, phân tích log, review, khảo sát codebase. Sandbox chỉ đọc, nhanh, không cần duyệt.
-- **edit**: sửa code, viết tài liệu, làm sạch dữ liệu, sắp xếp file. Mọi lần sửa phải nằm trong phạm vi glob. Thư mục không phải git thì có snapshot để khôi phục.
+- **edit --trust**: sửa code, viết tài liệu, làm sạch dữ liệu, sắp xếp file. Worker chạy không cần duyệt từng lệnh; khi xong, mọi thay đổi ngoài phạm vi glob tự bị hoàn tác từ snapshot.
 - **--network**: tìm web và truy cập mạng cho việc nghiên cứu.
 
-Kết quả trả về dạng JSON có cấu trúc (findings kèm bằng chứng, file đã đổi, kiểm tra đã chạy, nguồn). Chạy được nhiều worker song song. opencode được hỗ trợ làm backend phụ.
+Kết quả trả về dạng JSON có cấu trúc (findings kèm bằng chứng, file đã đổi, kiểm tra đã chạy, nguồn). Worker tự sửa và kiểm chứng lại đến khi đạt. Claude chỉ nhận một dòng tóm tắt khi xong, nên phần điều phối tốn rất ít token Claude. Chạy được nhiều worker song song. opencode được hỗ trợ làm backend phụ.
 
 ## Cài đặt
 
